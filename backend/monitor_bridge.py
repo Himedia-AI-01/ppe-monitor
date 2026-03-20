@@ -167,7 +167,24 @@ def _build_monitor(cam_source: str, conf_helmet: float, conf_vest: float):
         logger.info("YOLO monitor built successfully (device=%s)", device)
         return monitor
     except Exception as exc:
-        logger.warning("Could not build Monitor — raw frames only", exc_info=True)
+        logger.warning("Could not build Monitor with TensorRT engine; trying PyTorch .pt fallback", exc_info=True)
+
+        # Fallback to .pt if .engine exists but is incompatible with TensorRT version
+        fallback_person = str(BASE_DIR / "yolo12n.pt")
+        fallback_ppe = str(BASE_DIR / "best.pt")
+        if Path(fallback_person).exists() and Path(fallback_ppe).exists():
+            logger.info("Found .pt fallbacks: person=%s ppe=%s", fallback_person, fallback_ppe)
+            args.person_weights = fallback_person
+            args.ppe_weights = fallback_ppe
+            try:
+                monitor = wsm.Monitor(args)
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                logger.info("YOLO monitor built with .pt fallback (device=%s)", device)
+                return monitor
+            except Exception:
+                logger.warning("Failed to build Monitor with .pt fallback as well", exc_info=True)
+
+        logger.warning("Could not build Monitor — raw frames only after fallback")
         return None
 
 
