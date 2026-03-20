@@ -43,7 +43,7 @@ BASE_DIR = Path(__file__).parent.parent
 # ── Shared YOLO model ─────────────────────────────────────────────────────────
 _shared_monitor = None
 _shared_monitor_lock = threading.Lock()
-
+_force_pt_fallback = False
 # ── Batch inference dispatcher ────────────────────────────────────────────────
 # Camera workers submit frames to _infer_queue.
 # A single dispatcher thread collects up to BATCH_SIZE frames, runs one
@@ -129,22 +129,48 @@ def _build_monitor(cam_source: str, conf_helmet: float, conf_vest: float):
 
         def _find_model(stem: str) -> str:
             engine = BASE_DIR / f"{stem}.engine"
+            onnx = BASE_DIR / f"{stem}.onnx"
+            pt = BASE_DIR / f"{stem}.pt"
+
+            if _force_pt_fallback:
+                return str(pt)
+
             if _use_engine and engine.exists():
                 return str(engine)
-            if not _use_engine and engine.exists():
-                logger.info("TensorRT engine found but CUDA %s < 12 — using .pt fallback", torch.version.cuda)
-            return str(BASE_DIR / f"{stem}.pt")
+
+            if engine.exists() and not _use_engine:
+                logger.info("TensorRT engine found but CUDA %s < 12 — skip engine", torch.version.cuda)
+
+            if onnx.exists():
+                return str(onnx)
+
+            return str(pt)
 
         person_model = _find_model("yolo12n")
         ppe_model    = _find_model("best")
         logger.info("Models: person=%s  ppe=%s", Path(person_model).suffix, Path(ppe_model).suffix)
 
+        # We must set ppe_* correctly for Monitor._init_ppe_backend:
+        # - ppe_onnx is used if ppe_weights is empty
+        # - ppe_weights is used for Ultralytics/PyTorch/TensorRT path
+        ppe_weights = ""
+        ppe_onnx = ""
+
+        ppe_suffix = Path(ppe_model).suffix.lower()
+        if ppe_suffix == ".onnx":
+            ppe_onnx = ppe_model
+            fallback_pt = BASE_DIR / "best.pt"
+            if fallback_pt.exists():
+                ppe_weights = str(fallback_pt)
+        else:
+            ppe_weights = ppe_model
+
         args = argparse.Namespace(
             source=cam_source,
             person_weights=person_model,
             person_conf=0.45,
-            ppe_weights=ppe_model,
-            ppe_onnx="",
+            ppe_weights=ppe_weights,
+            ppe_onnx=ppe_onnx,
             class_names=["helmet", "vest"],
             input_size=640,
             conf_helmet=conf_helmet,
@@ -167,15 +193,32 @@ def _build_monitor(cam_source: str, conf_helmet: float, conf_vest: float):
         logger.info("YOLO monitor built successfully (device=%s)", device)
         return monitor
     except Exception as exc:
-        logger.warning("Could not build Monitor with TensorRT engine; trying PyTorch .pt fallback", exc_info=True)
+        logger.warning("Could not build Monitor with TensorRT engine; trying fallback model paths", exc_info=True)
 
-        # Fallback to .pt if .engine exists but is incompatible with TensorRT version
-        fallback_person = str(BASE_DIR / "yolo12n.pt")
-        fallback_ppe = str(BASE_DIR / "best.pt")
-        if Path(fallback_person).exists() and Path(fallback_ppe).exists():
-            logger.info("Found .pt fallbacks: person=%s ppe=%s", fallback_person, fallback_ppe)
-            args.person_weights = fallback_person
-            args.ppe_weights = fallback_ppe
+        # 1) Try ONNX fallback first
+        fallback_person_onnx = str(BASE_DIR / "yolo12n.onnx")
+        fallback_ppe_onnx = str(BASE_DIR / "best.onnx")
+        if Path(fallback_person_onnx).exists() and Path(fallback_ppe_onnx).exists():
+            logger.info("Found .onnx fallbacks: person=%s ppe=%s", fallback_person_onnx, fallback_ppe_onnx)
+            args.person_weights = fallback_person_onnx
+            args.ppe_weights = ""
+            args.ppe_onnx = fallback_ppe_onnx
+            try:
+                monitor = wsm.Monitor(args)
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                logger.info("YOLO monitor built with .onnx fallback (device=%s)", device)
+                return monitor
+            except Exception:
+                logger.warning("Failed to build Monitor with .onnx fallback", exc_info=True)
+
+        # 2) Try PyTorch .pt fallback
+        fallback_person_pt = str(BASE_DIR / "yolo12n.pt")
+        fallback_ppe_pt = str(BASE_DIR / "best.pt")
+        if Path(fallback_person_pt).exists() and Path(fallback_ppe_pt).exists():
+            logger.info("Found .pt fallbacks: person=%s ppe=%s", fallback_person_pt, fallback_ppe_pt)
+            args.person_weights = fallback_person_pt
+            args.ppe_weights = fallback_ppe_pt
+            args.ppe_onnx = ""
             try:
                 monitor = wsm.Monitor(args)
                 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -184,7 +227,7 @@ def _build_monitor(cam_source: str, conf_helmet: float, conf_vest: float):
             except Exception:
                 logger.warning("Failed to build Monitor with .pt fallback as well", exc_info=True)
 
-        logger.warning("Could not build Monitor — raw frames only after fallback")
+        logger.warning("Could not build Monitor — raw frames only after all fallbacks")
         return None
 
 
@@ -212,11 +255,24 @@ def _get_shared_monitor():
 # ── Batch result parsers ──────────────────────────────────────────────────────
 
 def _parse_person_boxes(result) -> list:
-    """Ultralytics Results → List[Box] (person class only, area ≥ 900px²)."""
+    """Convert respiratory output to List[Box].
+
+    - If result is ulralytics.Results-like, parse .boxes
+    - If result is list[Box], return as-is
+    - If result is empty list, return []
+    """
     sys.path.insert(0, str(BASE_DIR))
     from workplace_safety_monitor import Box  # noqa: PLC0415
+
+    if result is None:
+        return []
+
+    if isinstance(result, list):
+        # already parsed list[Box]
+        return result
+
     boxes = []
-    for b in result.boxes:
+    for b in getattr(result, 'boxes', []):
         if int(b.cls) != 0:
             continue
         x1, y1, x2, y2 = (int(v) for v in b.xyxy[0].tolist())
@@ -227,12 +283,25 @@ def _parse_person_boxes(result) -> list:
 
 
 def _parse_ppe_boxes(result) -> list:
-    """Ultralytics Results → List[Box] using model's own class names as labels.
-    _split_classes() matches on label string ('helmet', 'vest', …) not cls int.
-    """
+    """Convert PPE output to List[Box]."""
     sys.path.insert(0, str(BASE_DIR))
     from workplace_safety_monitor import Box  # noqa: PLC0415
-    # Use the model's names dict so labels match what _split_classes expects
+
+    if result is None:
+        return []
+
+    if isinstance(result, list):
+        return result
+
+    boxes = []
+    names = getattr(result, 'names', {})
+    for b in getattr(result, 'boxes', []):
+        x1, y1, x2, y2 = (int(v) for v in b.xyxy[0].tolist())
+        cls = int(b.cls)
+        label = names.get(cls, str(cls))
+        boxes.append(Box(x1, y1, x2, y2, float(b.conf), cls, label))
+    return boxes
+
     names = result.names  # e.g. {4: 'Helmet', 7: 'Vest', …}
     boxes = []
     for b in result.boxes:
@@ -246,7 +315,7 @@ def _parse_ppe_boxes(result) -> list:
 # ── Dispatcher (runs in its own daemon thread) ────────────────────────────────
 
 def _run_dispatcher():
-    global _gpu_infer_ms_per_frame, _dispatcher_running
+    global _gpu_infer_ms_per_frame, _dispatcher_running, _shared_monitor, _force_pt_fallback
     logger.info("Batch inference dispatcher started (batch_size=%d)", BATCH_SIZE)
 
     while _dispatcher_running:
@@ -287,9 +356,18 @@ def _run_dispatcher():
 
             t0 = time.perf_counter()
 
-            person_res = m.person_det.model(frames, conf=m.person_det.conf, verbose=False)
-            ppe_res    = m.ppe_backend.model(frames, conf=m.ppe_backend.conf_th,
+            if hasattr(m.person_det, 'model') and callable(getattr(m.person_det, 'model')):
+                person_res = m.person_det.model(frames, conf=m.person_det.conf, verbose=False)
+            else:
+                person_res = [m.person_det.detect(f) for f in frames]
+
+            if hasattr(m.ppe_backend, 'model') and callable(getattr(m.ppe_backend, 'model')):
+                ppe_res = m.ppe_backend.model(frames, conf=m.ppe_backend.conf_th,
                                               iou=m.ppe_backend.nms_iou, verbose=False)
+            elif hasattr(m.ppe_backend, 'infer') and callable(getattr(m.ppe_backend, 'infer')):
+                ppe_res = [m.ppe_backend.infer(f) for f in frames]
+            else:
+                raise RuntimeError('Unsupported PPE backend interface')
 
             elapsed = (time.perf_counter() - t0) * 1000
             per_frame = elapsed / BATCH_SIZE
@@ -305,6 +383,16 @@ def _run_dispatcher():
 
         except Exception as exc:
             logger.warning("Dispatcher inference error: %s", exc, exc_info=True)
+
+            # If the failure is likely ONNX/Reshape related, force PT fallback and reinit.
+            ppe_is_onnx = getattr(m, 'ppe_backend', None) is not None and getattr(type(m.ppe_backend), '__name__', '').lower() == 'ppeonnx'
+            if not _force_pt_fallback and (isinstance(exc, cv2.error) or 'reshape' in str(exc).lower()) and ppe_is_onnx:
+                logger.warning("Detected ONNX reshape error, forcing PT fallback and rebuilding shared monitor")
+                _force_pt_fallback = True
+                with _shared_monitor_lock:
+                    _shared_monitor = None
+                    _get_shared_monitor()
+
             for req in batch:
                 req.persons, req.ppe = [], []
                 req.error = exc

@@ -473,12 +473,28 @@ class Monitor:
         logger.info("Monitor initialized.")
 
     def _init_ppe_backend(self, args) -> Any:
-        if args.ppe_weights and _ULTRA_AVAILABLE:
+        # priority: onnx backend, then ultralytics (.pt or .engine)
+        if args.ppe_onnx:
+            names = [n.strip() for n in (args.class_names or ['helmet', 'vest'])]
+            try:
+                onnx_backend = PPEOnnx(args.ppe_onnx, names, min(args.conf_helmet, args.conf_vest), args.nms_iou, input_size=args.input_size)
+                # quick sanity check with dummy frame to detect shape issues early
+                dummy_frame = np.zeros((args.input_size, args.input_size, 3), dtype=np.uint8)
+                onnx_backend.infer(dummy_frame)
+                return onnx_backend
+            except Exception as e:
+                logger.warning("PPEOnnx initialization/inference check failed: %s", e, exc_info=True)
+                if args.ppe_weights:
+                    logger.info("Falling back to PPEUltralytics with %s", args.ppe_weights)
+                    class_map = {0: 'helmet', 1: 'vest'}
+                    return PPEUltralytics(args.ppe_weights, min(args.conf_helmet, args.conf_vest), args.nms_iou, class_map)
+                raise RuntimeError("PPE ONNX failed and no PT fallback available") from e
+        elif args.ppe_weights and _ULTRA_AVAILABLE:
             class_map = {0: 'helmet', 1: 'vest'}
             return PPEUltralytics(args.ppe_weights, min(args.conf_helmet, args.conf_vest), args.nms_iou, class_map)
-        elif args.ppe_onnx:
-            names = [n.strip() for n in (args.class_names or ['helmet', 'vest'])]
-            return PPEOnnx(args.ppe_onnx, names, min(args.conf_helmet, args.conf_vest), args.nms_iou, input_size=args.input_size)
+        elif args.ppe_weights:
+            class_map = {0: 'helmet', 1: 'vest'}
+            return PPEUltralytics(args.ppe_weights, min(args.conf_helmet, args.conf_vest), args.nms_iou, class_map)
         else:
             raise RuntimeError("Provide --ppe-weights (.pt) or --ppe-onnx (.onnx)")
 
