@@ -1,4 +1,4 @@
---extra-index-url https://download.pytorch.org/whl/cu124
+--extra-index-url https://download.pytorch.org/whl/cu128
 aiofiles>=23.0.0
 aiosqlite>=0.20.0
 bcrypt>=4.0.0
@@ -9,7 +9,7 @@ python-jose[cryptography]>=3.3.0
 python-multipart>=0.0.9
 sqlalchemy>=2.0.0
 tensorrt>=8.6.0
-torch==2.5.1+cu124
-torchvision==0.20.1+cu124
+torch==2.10.0+cu128
+torchvision==0.25.0+cu128
 ultralytics>=8.0.0
 uvicorn[standard]>=0.29.0
